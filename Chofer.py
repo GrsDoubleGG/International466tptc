@@ -1,50 +1,22 @@
-"""
-Chofer de Springfield: la misma interfaz de Chofer.py, pero el modelo corre en C
-(springfield.c). Python solo dibuja; todas las cuentas las hace el ejecutable.
-
-Primero compila el modelo en la misma carpeta que este archivo:
-    Windows (Developer Command Prompt for VS):  cl /O2 /utf-8 springfield.c
-    Linux / MinGW:                              gcc -O2 -o springfield springfield.c -lm
-
-Luego:
-    python chofer_springfield.py               interfaz gráfica
-    python chofer_springfield.py --prueba      los tres episodios en consola
-    python chofer_springfield.py --exe RUTA    si el ejecutable está en otro lado
-"""
 from __future__ import annotations
 
 import argparse
 import math
-import subprocess
-import sys
 import time
 import tkinter as tk
 from collections import deque
 from dataclasses import dataclass, field
-from pathlib import Path
 from tkinter import ttk, messagebox
+
+from Motor import Motor, EstadoMotor
+from Transmision import Transmision, EstadoTransmision
+from Diferencial import Diferencial, CargaFija, Balance, SUPERFICIES
 
 COMPONENTES = ("motor", "transmision", "diferencial")
 ESTADOS = ("underload", "stable", "overload")
-MARCHAS = ("N", "LL", "L", "1", "2", "3", "4", "5", "6", "7", "8")   # mismo orden que el enum en C
-CONDICION_EMBRAGUE = ("abierto", "patinando", "acoplado")
-
-SUPERFICIES = {
-    "Asfalto seco": (0.70, 0.007),
-    "Terracería": (0.50, 0.020),
-    "Terracería mojada / lodo": (0.30, 0.050),
-}
-
-INSTRUCCIONES_COMPILAR = (
-    "No encontré el ejecutable de springfield.c junto a este archivo.\n\n"
-    "Compílalo en la misma carpeta:\n"
-    "  Windows:  cl /O2 /utf-8 springfield.c\n"
-    "  gcc:      gcc -O2 -o springfield springfield.c -lm\n\n"
-    "o indica la ruta con --exe."
-)
 
 
-# ================================================================ datos que manda el C
+# ================================================================ lazo de simulación
 
 @dataclass
 class Configuracion:
@@ -53,47 +25,6 @@ class Configuracion:
     masa: float = 15000.0
     pendiente: float = 0.0
     superficie: str = "Asfalto seco"
-
-
-@dataclass
-class EstadoMotor:
-    rpm: float
-    rpm_objetivo: float
-    combustible: float
-    torque_neto: float
-    torque_maximo: float
-    torque_carga: float
-    potencia_kw: float
-    rpm_por_s: float
-    apagado: bool
-
-
-@dataclass
-class EstadoTransmision:
-    marcha: str
-    relacion: float
-    eficiencia: float
-    torque_entrada: float
-    torque_salida: float
-    rpm_salida: float
-    uso_capacidad: float
-    deslizamiento_rpm: float
-    embrague: str
-
-
-@dataclass
-class Balance:
-    f_entregada: float
-    f_requerida: float
-    f_rodadura: float
-    f_pendiente: float
-    f_aire: float
-    f_maxima: float
-    f_adherencia: float
-    uso_entregada: float
-    uso_maxima: float
-    velocidad: float
-    aceleracion: float
 
 
 @dataclass
@@ -108,114 +39,72 @@ class Lectura:
     estados: dict = field(default_factory=dict)
 
 
-def _parsear(linea: str) -> Lectura:
-    partes = linea.rstrip("\r\n").split("|")
-    if len(partes) != 4:
-        raise RuntimeError(f"Respuesta rara del C: {linea!r}")
-    v = [float(x) for x in partes[0].split()]
-    if len(v) != 34:
-        raise RuntimeError(f"Esperaba 34 números y llegaron {len(v)}")
-    f_ent, f_req, f_max = v[22], v[23], v[27]
-    return Lectura(
-        t=v[0],
-        acelerador=v[1],
-        motor=EstadoMotor(
-            rpm=v[2], rpm_objetivo=v[3], combustible=v[4], torque_neto=v[5],
-            torque_maximo=v[6], torque_carga=v[7], potencia_kw=v[8], rpm_por_s=v[9],
-            apagado=bool(v[10]),
-        ),
-        trans=EstadoTransmision(
-            marcha=MARCHAS[int(v[11])], relacion=v[12], eficiencia=v[13],
-            torque_entrada=v[14], torque_salida=v[15], rpm_salida=v[16],
-            uso_capacidad=v[17], deslizamiento_rpm=v[18],
-            embrague=CONDICION_EMBRAGUE[int(v[19])],
-        ),
-        balance=Balance(
-            f_entregada=f_ent, f_requerida=f_req, f_rodadura=v[24], f_pendiente=v[25],
-            f_aire=v[26], f_maxima=f_max, f_adherencia=v[28],
-            uso_entregada=f_req / f_ent if f_ent > 1.0 else math.inf,
-            uso_maxima=f_req / f_max if f_max > 1.0 else math.inf,
-            velocidad=v[29], aceleracion=v[30],
-        ),
-        relacion_diff=v[20],
-        torque_eje=v[21],
-        estados={
-            "motor": (ESTADOS[int(v[31])], partes[1]),
-            "transmision": (ESTADOS[int(v[32])], partes[2]),
-            "diferencial": (ESTADOS[int(v[33])], partes[3]),
-        },
-    )
+class TrenMotriz:
+    DT = 0.001
 
-
-# ================================================================ puente con el ejecutable
-
-def encontrar_exe(ruta: str | None) -> str | None:
-    if ruta:
-        return ruta if Path(ruta).exists() else None
-    aqui = Path(__file__).resolve().parent
-    for nombre in ("springfield.exe", "springfield"):
-        p = aqui / nombre
-        if p.exists():
-            return str(p)
-    return None
-
-
-class TrenMotrizC:
-    """Mismo papel que TrenMotriz en Chofer.py, pero cada paso lo calcula el C."""
-
-    def __init__(self, exe: str):
-        self.proc = subprocess.Popen(
-            [exe, "--chofer"],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, encoding="utf-8", bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+    def __init__(self):
+        self.motor = Motor()
+        self.trans = Transmision()
+        self.diff = Diferencial()
+        self.t = 0.0
         self.acelerador = 0.0
-        self._ultima = self._pedir("lee")
-
-    @property
-    def t(self) -> float:
-        return self._ultima.t
-
-    def _pedir(self, orden: str) -> Lectura:
-        try:
-            self.proc.stdin.write(orden + "\n")
-            self.proc.stdin.flush()
-            linea = self.proc.stdout.readline()
-        except (BrokenPipeError, OSError) as e:
-            raise RuntimeError("El modelo en C dejó de responder") from e
-        if not linea:
-            raise RuntimeError("El modelo en C se cerró (¿se compiló bien?)")
-        self._ultima = _parsear(linea)
-        return self._ultima
 
     def configurar(self, cfg: Configuracion) -> None:
+        self.trans.seleccionar(cfg.marcha)
+        self.diff.fijar_rango(cfg.rango)
         mu, crr = SUPERFICIES[cfg.superficie]
-        marcha = MARCHAS.index(cfg.marcha)
-        alto = 1 if cfg.rango == "alta" else 0
-        self._pedir(f"config {marcha} {alto} {cfg.masa!r} {cfg.pendiente!r} {mu!r} {crr!r}")
+        self.diff.fijar_carga(CargaFija(masa=cfg.masa, pendiente=cfg.pendiente, mu=mu, crr=crr))
 
     def reiniciar(self) -> None:
-        self._pedir("reinicia")
+        self.motor.reiniciar()
+        self.trans.reiniciar()
+        self.diff.reiniciar()
+        self.t = 0.0
+        self.motor.fijar_acelerador(self.acelerador)
 
     def fijar_acelerador(self, fraccion: float) -> None:
         self.acelerador = min(max(fraccion, 0.0), 1.0)
-        self._pedir(f"pedal {self.acelerador!r}")
+        self.motor.fijar_acelerador(self.acelerador)
+
+    def _subpaso(self, dt: float) -> None:
+        m, tr, d = self.motor, self.trans, self.diff
+        if tr.en_neutral:
+            tr.embrague.reiniciar()
+            t_emb = 0.0
+        else:
+            w_in = tr.velocidad_entrada(d.velocidad_cardan())
+            j_in = tr.inercia_vista_en_entrada(d.inercia_vista_en_cardan())
+            t_in = -tr.torque_reflejado_entrada(d.torque_reaccion_cardan())
+            t_emb = tr.embrague.acoplar(dt, m.omega, w_in, m.p.inercia, j_in,
+                                        m.torque_neto(), t_in)
+        m.paso(dt, t_emb)
+        d.paso(dt, tr.torque_salida(t_emb), tr.inercia_reflejada_salida())
+        self.t += dt
 
     def avanzar(self, duracion: float) -> None:
-        self._pedir(f"avanza {duracion!r}")
+        for _ in range(max(1, round(duracion / self.DT))):
+            self._subpaso(self.DT)
+
+    def fuerza_maxima(self) -> float:
+        return self.diff.fuerza_rueda(self.trans.torque_salida(self.motor.torque_maximo()))
 
     def lectura(self) -> Lectura:
-        return self._pedir("lee")
-
-    def cerrar(self) -> None:
-        if self.proc.poll() is None:
-            try:
-                self.proc.stdin.write("adios\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=1.0)
-            except Exception:
-                self.proc.kill()
+        em = self.motor.estado()
+        b = self.diff.balance(self.fuerza_maxima())
+        return Lectura(
+            t=self.t,
+            acelerador=self.acelerador,
+            motor=em,
+            trans=self.trans.estado(self.diff.velocidad_cardan()),
+            balance=b,
+            relacion_diff=self.diff.relacion,
+            torque_eje=self.diff.t_eje,
+            estados={
+                "motor": self.motor.evaluar(),
+                "transmision": self.trans.evaluar(em.rpm, em.combustible),
+                "diferencial": self.diff.evaluar(b),
+            },
+        )
 
 
 class Indicador:
@@ -238,6 +127,42 @@ class Indicador:
             self.estado, self.mensaje, self._candidato = estado, mensaje, None
 
 
+# ================================================================ prueba sin interfaz
+
+def correr_prueba(cfg: Configuracion, perfil, duracion: float, cada: float = 1.0) -> list[Lectura]:
+    sim = TrenMotriz()
+    sim.configurar(cfg)
+    indicadores = {c: Indicador() for c in COMPONENTES}
+    lecturas = []
+    print(f"\n{cfg}")
+    print(f"{'t':>5} {'acel':>5} {'rpm':>6} {'comb':>5} {'Tmot':>6} {'Tcard':>7} "
+          f"{'Fent':>7} {'Freq':>7} {'km/h':>6} {'motor':>10} {'trans':>10} {'diff':>10}")
+    paso = 0.033
+    proximo = 0.0
+    while sim.t < duracion - 1e-9:
+        sim.fijar_acelerador(perfil(sim.t))
+        sim.avanzar(paso)
+        lec = sim.lectura()
+        for c in COMPONENTES:
+            indicadores[c].actualizar(*lec.estados[c], paso)
+        if sim.t >= proximo - 1e-9:
+            proximo += cada
+            b = lec.balance
+            print(f"{lec.t:5.1f} {lec.acelerador:5.0%} {lec.motor.rpm:6.0f} {lec.motor.combustible:5.2f} "
+                  f"{lec.motor.torque_neto:6.0f} {lec.trans.torque_salida:7.0f} "
+                  f"{b.f_entregada / 1e3:6.1f}k {b.f_requerida / 1e3:6.1f}k {b.velocidad * 3.6:6.1f} "
+                  + " ".join(f"{indicadores[c].estado:>10}" for c in COMPONENTES))
+            lecturas.append(lec)
+    return lecturas
+
+
+def escenarios_prueba() -> None:
+    correr_prueba(Configuracion(marcha="1"), lambda t: 0.6, 10.0)
+    correr_prueba(Configuracion(marcha="3", pendiente=12.0, masa=22000.0), lambda t: 1.0, 12.0)
+    correr_prueba(Configuracion(marcha="LL", rango="baja", pendiente=20.0, masa=20000.0,
+                                superficie="Terracería mojada / lodo"), lambda t: 1.0, 6.0)
+
+
 # ================================================================ interfaz gráfica
 
 COLORES = {
@@ -256,15 +181,9 @@ TINTES = {"underload": "#dbe9f6", "stable": "#dcf0e3", "overload": "#f8dcdb"}
 ETIQUETAS = {"underload": "UNDER", "stable": "STABLE", "overload": "OVER"}
 FUENTE = "Segoe UI"
 
-SUBTITULOS = (
-    "Planta Nuclear de Springfield\nDT466E · 862 N·m @ 1800 rpm",
-    "Kwik-E-Mart de Apu\nRT-8908LL · 8 + 2 bajas, 1166 N·m",
-    "Patty y Selma\nEaton 16244 · 4.88 / 6.55",
-)
-
 
 class Diagrama(tk.Canvas):
-    ANCHO, ALTO = 860, 280
+    ANCHO, ALTO = 860, 262
     CAJA_W, CAJA_H, CAJA_Y = 220, 104, 24
     XS = (16, 312, 608)
     TITULOS = ("MOTOR", "TRANSMISIÓN", "DIFERENCIAL")
@@ -307,8 +226,8 @@ class Diagrama(tk.Canvas):
                              font=(FUENTE, 8, "bold"), fill=COLORES["tenue"])
         self.lamparas[nombre] = lamparas
         self.mensajes[nombre] = self.create_text(
-            x + self.CAJA_W / 2, y + self.CAJA_H + 76, text="", width=self.CAJA_W,
-            font=(FUENTE, 10), fill=COLORES["tinta"], justify="center", anchor="n")
+            x + self.CAJA_W / 2, y + self.CAJA_H + 88, text="", width=self.CAJA_W,
+            font=(FUENTE, 10), fill=COLORES["tinta"], justify="center")
 
     def pintar(self, indicadores, lec: Lectura):
         for nombre in COMPONENTES:
@@ -446,11 +365,11 @@ class Lecturas(ttk.Frame):
 class PanelChofer(tk.Tk):
     PERIODO_MS = 33
 
-    def __init__(self, exe: str):
+    def __init__(self):
         super().__init__()
-        self.title("Chofer de Springfield — tren motriz International (modelo en C)")
+        self.title("Chofer — tren motriz International (versión de prueba)")
         self.configure(bg=COLORES["fondo"])
-        self.sim = TrenMotrizC(exe)
+        self.sim = TrenMotriz()
         self.indicadores = {c: Indicador() for c in COMPONENTES}
         self.corriendo = False
         self._ultimo = time.perf_counter()
@@ -461,8 +380,9 @@ class PanelChofer(tk.Tk):
         self.bind("<Up>", lambda e: self._mover_acelerador(5))
         self.bind("<Down>", lambda e: self._mover_acelerador(-5))
         self.bind("<space>", lambda e: self._alternar())
-        self.protocol("WM_DELETE_WINDOW", self._cerrar)
         self.after(self.PERIODO_MS, self._ciclo)
+
+
 
     def _estilo(self):
         estilo = ttk.Style(self)
@@ -483,7 +403,13 @@ class PanelChofer(tk.Tk):
         self.lbl_estado = ttk.Label(izq, text="", foreground=COLORES["tenue"], padding=(0, 10))
         self.lbl_estado.grid(row=3, column=0, sticky="w")
 
-        self.diagrama = Diagrama(der, SUBTITULOS)
+        m, tr, d = self.sim.motor.p, self.sim.trans.p, self.sim.diff.p
+        subtitulos = (
+            f"{m.nombre}\n{max(m.curva_torque)} N·m @ {m.curva_rpm[m.curva_torque.index(max(m.curva_torque))]} rpm",
+            f"{tr.nombre}\n8 + 2 bajas, {tr.torque_max_entrada:.0f} N·m máx.",
+            f"{d.nombre}\n{d.relacion_alta} / {d.relacion_baja}",
+        )
+        self.diagrama = Diagrama(der, subtitulos)
         self.diagrama.grid(row=0, column=0, sticky="ew")
         self.lecturas = Lecturas(der)
         self.lecturas.grid(row=1, column=0, sticky="ew", pady=8)
@@ -527,7 +453,7 @@ class PanelChofer(tk.Tk):
                                           textvariable=self.var_pend, width=10)),
             ("Superficie", ttk.Combobox(marco, values=list(SUPERFICIES), textvariable=self.var_sup,
                                         state="readonly", width=20)),
-            ("Marcha", ttk.Combobox(marco, values=list(MARCHAS),
+            ("Marcha", ttk.Combobox(marco, values=self.sim.trans.marchas(),
                                     textvariable=self.var_marcha, state="readonly", width=10)),
             ("Rango del eje", ttk.Combobox(marco, values=("alta", "baja"),
                                            textvariable=self.var_rango, state="readonly", width=10)),
@@ -537,6 +463,7 @@ class PanelChofer(tk.Tk):
             ttk.Label(marco, text=texto).grid(row=fila, column=0, sticky="w", pady=2)
             widget.grid(row=fila, column=1, sticky="ew", padx=(8, 0), pady=2)
             self.entradas.append(widget)
+
 
     def _aplicar_configuracion(self) -> bool:
         try:
@@ -592,18 +519,14 @@ class PanelChofer(tk.Tk):
         self.tendencia.limpiar()
         self._refrescar(self.sim.lectura())
 
+
     def _ciclo(self):
         ahora = time.perf_counter()
         dt = min(ahora - self._ultimo, 0.1)
         self._ultimo = ahora
         if self.corriendo:
-            try:
-                self.sim.avanzar(dt)
-                lec = self.sim.lectura()
-            except RuntimeError as e:
-                self.corriendo = False
-                messagebox.showerror("¡D'oh!", str(e))
-                return
+            self.sim.avanzar(dt)
+            lec = self.sim.lectura()
             for c in COMPONENTES:
                 self.indicadores[c].actualizar(*lec.estados[c], dt)
             self._refrescar(lec)
@@ -616,34 +539,17 @@ class PanelChofer(tk.Tk):
         estado = "corriendo" if self.corriendo else "en pausa"
         self.lbl_estado.configure(text=f"t = {lec.t:6.1f} s   ({estado})")
 
-    def _cerrar(self):
-        self.sim.cerrar()
-        self.destroy()
-
 
 # ================================================================ entrada
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Chofer de Springfield (modelo en C)")
-    parser.add_argument("--prueba", action="store_true", help="corre los episodios en consola")
-    parser.add_argument("--exe", help="ruta al ejecutable compilado de springfield.c")
+    parser = argparse.ArgumentParser(description="Chofer del tren motriz International")
+    parser.add_argument("--prueba", action="store_true", help="corre escenarios sin interfaz")
     args = parser.parse_args()
-
-    exe = encontrar_exe(args.exe)
-    if exe is None:
-        if args.prueba:
-            sys.exit(INSTRUCCIONES_COMPILAR)
-        raiz = tk.Tk()
-        raiz.withdraw()
-        messagebox.showerror("¡D'oh! Falta el ejecutable", INSTRUCCIONES_COMPILAR)
-        raiz.destroy()
-        sys.exit(1)
-
     if args.prueba:
-        salida = subprocess.run([exe], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        print(salida.stdout.decode("utf-8", errors="replace"), end="")
+        escenarios_prueba()
     else:
-        PanelChofer(exe).mainloop()
+        PanelChofer().mainloop()
 
 
 if __name__ == "__main__":
